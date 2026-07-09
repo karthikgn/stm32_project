@@ -1,0 +1,532 @@
+#include "PayloadSensor.h"
+
+#include <iomanip>
+
+// ---------------- REGISTERS ----------------
+#define MPU_ADDR       0x68
+#define MAG_ADDR       0x0C
+#define BMP280_ADDR    0x76
+
+#define PWR_MGMT_1     0x6B
+#define PWR_MGMT_2     0x6C
+#define CONFIG         0x1A
+#define GYRO_CONFIG    0x1B
+#define ACCEL_CONFIG   0x1C
+#define SMPLRT_DIV     0x19
+#define WHO_AM_I       0x75
+
+#define INT_PIN_CFG    0x37
+#define USER_CTRL      0x6A
+
+#define MAG_CNTL1      0x0A
+#define MAG_XOUT       0x03
+
+PayloadSensor::PayloadSensor(std::atomic<bool> &runFlag,const char* device, uint8_t addr)
+	  : _running(runFlag),i2c_fd(-1), i2c_device(device), i2c_addr(addr),
+      accel_scale(2048.0f), gyro_scale(16.4f)
+{
+	accel_bias[0] = accel_bias[1] = accel_bias[2] = 0.0f;
+    gyro_bias[0] = gyro_bias[1] = gyro_bias[2] = 0.0f;
+}
+
+PayloadSensor::~PayloadSensor()
+{
+	if (i2c_fd >= 0)
+        close(i2c_fd);
+}
+
+bool PayloadSensor::writeRegister(uint8_t reg, uint8_t data) 
+{
+	uint8_t buf[2] = {reg, data};
+    if (write(i2c_fd, buf, 2) != 2) {
+        std::cerr << "Failed to write to register 0x" << std::hex << (int)reg << std::dec << "\n";
+        return false;
+    }
+    return true;
+}
+
+bool PayloadSensor::readRegisters(uint8_t reg, uint8_t* buf, size_t len) 
+{
+    if (write(i2c_fd, &reg, 1) != 1) {
+        std::cerr << "Failed to write register address 0x" << std::hex << (int)reg << std::dec << "\n";
+        return false;
+    }
+    if (read(i2c_fd, buf, len) != (ssize_t)len) {
+        std::cerr << "Failed to read registers from 0x" << std::hex << (int)reg << std::dec << "\n";
+        return false;
+    }
+    return true;
+}
+
+//@write REgister function with three parameters
+bool PayloadSensor::writeRegister(uint8_t devAddr, uint8_t reg, uint8_t value)
+{
+    if (ioctl(i2c_fd, I2C_SLAVE, devAddr) < 0) {
+        perror("I2C set address failed");
+        return false;
+    }
+
+    uint8_t buf[2];
+    buf[0] = reg;
+    buf[1] = value;
+
+    if (write(i2c_fd, buf, 2) != 2) {
+        perror("I2C write failed");
+        return false;
+    }
+
+    return true;
+}
+
+//@Read register function with three parameters
+bool PayloadSensor::readRegisters(uint8_t devAddr, uint8_t reg, uint8_t* data, int len)
+{
+    if (ioctl(i2c_fd, I2C_SLAVE, devAddr) < 0) {
+        perror("I2C set address failed");
+        return false;
+    }
+
+    // send register address
+    if (write(i2c_fd, &reg, 1) != 1) {
+        perror("I2C write reg failed");
+        return false;
+    }
+
+    // read data
+    if (read(i2c_fd, data, len) != len) {
+        perror("I2C read failed");
+        return false;
+    }
+
+    return true;
+}
+
+bool PayloadSensor::setAddress(uint8_t addr)
+{
+    if (ioctl(i2c_fd, I2C_SLAVE, addr) < 0) {
+        perror("I2C set address failed");
+        return false;
+    }
+    return true;
+}
+
+//@Initialize the I2C devices and do some configuration
+bool PayloadSensor::initialize() {
+    i2c_fd = open(i2c_device, O_RDWR);
+    if (i2c_fd < 0) {
+        std::cerr << "Failed to open I2C device " << i2c_device << "\n";
+        return false;
+    }
+    if (ioctl(i2c_fd, I2C_SLAVE, i2c_addr) < 0) {
+        std::cerr << "Failed to set I2C address 0x" << std::hex << (int)i2c_addr << std::dec << "\n";
+        close(i2c_fd);
+        i2c_fd = -1;
+        return false;
+    }
+
+    if (!writeRegister(PWR_MGMT_1, 0x80)) return false; // Reset
+    usleep(100000);
+
+    if (!writeRegister(PWR_MGMT_1, 0x01)) return false; // Wake up clock source
+
+    if (!writeRegister(PWR_MGMT_2, 0x00)) return false; // Enable all sensors
+    
+
+    if (!writeRegister(GYRO_CONFIG, 0x18)) return false; // Gyro ±2000 dps
+
+    if (!writeRegister(ACCEL_CONFIG, 0x18)) return false; // Accel ±16g
+
+    if (!writeRegister(CONFIG, 0x03)) return false; // DLPF
+
+    if (!writeRegister(SMPLRT_DIV, 0x04)) return false; // Sample rate div
+    
+      // ---------------- MAG SETUP ----------------
+    if (!writeRegister(INT_PIN_CFG, 0x02)) return false; // BYPASS ENABLE
+    if (!writeRegister(USER_CTRL, 0x00)) return false;   // disable I2C master
+        usleep(10000);
+
+   // -------- MAG --------
+	setAddress(MAG_ADDR);
+	
+	writeRegister(MAG_CNTL1, 0x00);//  Power down magnetometer
+	usleep(10000);
+	
+	// 2. Enter Fuse ROM access mode
+	writeRegister(MAG_CNTL1, 0x0F);
+	usleep(10000);
+	
+	// 3. Read ASA registers
+	uint8_t asa[3];
+	readRegisters(0x10, asa, 3);
+
+	asa_x = asa[0];
+	asa_y = asa[1];
+	asa_z = asa[2];
+
+	std::cout << "ASA: "
+          << (int)asa_x << ", "
+          << (int)asa_y << ", "
+          << (int)asa_z << std::endl;
+
+	// 4. Power down again
+	writeRegister(MAG_CNTL1, 0x00);
+	usleep(10000);
+
+	// 5. Set continuous measurement mode (100 Hz, 16-bit)
+	writeRegister(MAG_CNTL1, 0x16);
+	usleep(10000);
+	// -------- BACK TO MPU --------
+	setAddress(MPU_ADDR);
+    uint8_t id = 0;
+    if (!readRegisters(WHO_AM_I, &id, 1)) return false;
+    std::cout << "MPU9250 initialized, WHO_AM_I=0x" << std::hex << (int)id << std::dec << "\n";
+	
+    uint8_t mag_id;
+	setAddress(0x0C);
+	readRegisters(0x00, &mag_id, 1);
+	std::cout << "MAG ID: 0x" << std::hex << (int)mag_id << std::endl;
+	
+
+    previous_time = std::chrono::steady_clock::now();
+    
+    return true;
+}
+
+//@Accel and Gyro calibration function
+bool PayloadSensor::calibrate(int samples) {
+    std::cout << "Calibration will start in 5 seconds... Keep MPU9250 level and still\n";
+    usleep(2000);
+    std::cout << "Calibrating... Keep MPU9250 still\n";
+
+    float accel_sum[3] = {0.0f, 0.0f, 0.0f};
+    float gyro_sum[3] = {0.0f, 0.0f, 0.0f};
+
+    for (int i = 0; i < samples; ++i) {
+        uint8_t data[14];
+        if (!readRegisters(MPU_ADDR, 0x3B, data, 14))
+            return false;
+
+        ax_raw = (data[0] << 8) | data[1];
+        ay_raw = (data[2] << 8) | data[3];
+        az_raw = (data[4] << 8) | data[5];
+        gx_raw = (data[8] << 8) | data[9];
+        gy_raw = (data[10] << 8) | data[11];
+        gz_raw = (data[12] << 8) | data[13];
+
+        accel_sum[0] += (float)ax_raw ;
+        accel_sum[1] += (float)ay_raw ;
+        accel_sum[2] += (float)az_raw ;
+        gyro_sum[0] += (float)gx_raw / gyro_scale;
+        gyro_sum[1] += (float)gy_raw / gyro_scale;
+        gyro_sum[2] += (float)gz_raw / gyro_scale;
+
+        usleep(2000);
+    }
+
+    accel_bias[0] = accel_sum[0] / samples;
+    accel_bias[1] = accel_sum[1] / samples;
+    accel_bias[2] = (accel_sum[2] / samples) - accel_scale; // Gravity compensation
+    gyro_bias[0] = gyro_sum[0] / samples;
+    gyro_bias[1] = gyro_sum[1] / samples;
+    gyro_bias[2] = gyro_sum[2] / samples;
+
+    std::cout << "Calibration complete\n";
+    return true;
+}
+
+//@Raw Accel and Gyro data reading function
+bool PayloadSensor::readSensorData() {
+    uint8_t data[14];
+    if (!readRegisters(MPU_ADDR, 0x3B, data, 14))
+        return false;
+
+    ax_raw = (data[0] << 8) | data[1];
+    ay_raw = (data[2] << 8) | data[3];
+    az_raw = (data[4] << 8) | data[5];
+    gx_raw = (data[8] << 8) | data[9];
+    gy_raw = (data[10] << 8) | data[11];
+    gz_raw = (data[12] << 8) | data[13];
+
+    return true;
+}
+
+//@Magnetometer calibration
+void PayloadSensor::calibrateMagnetometer(){
+
+	//Update:
+	//std::cout << mag_min[0] << " " << mag_min[1] << " " << mag_min[2] << mag_max[0] << " " << mag_max[1] << " " << mag_max[2] << " " << "\n" ;
+	mag_min[0] = std::min(mag_min[0], (float)mx_raw);
+	mag_min[1] = std::min(mag_min[1], (float)my_raw);
+	mag_min[2] = std::min(mag_min[2], (float)mz_raw);
+
+	mag_max[0] = std::max(mag_max[0], (float)mx_raw);
+	mag_max[1] = std::max(mag_max[1], (float)my_raw);
+	mag_max[2] = std::max(mag_max[2], (float)mz_raw);
+	
+       std::cout << mag_min[0] << " " << mag_min[1] << " " << mag_min[2] << mag_max[0] << " " << mag_max[1] << " " << mag_max[2] << "\n" ;
+	
+}
+
+//@ Magnetometer offset calculation after calibration
+void PayloadSensor::computeMagnetometer(){
+	//✅ Step 4: Compute bias (hard iron)
+
+	mag_bias[0] = (mag_max[0] + mag_min[0]) / 2;
+	mag_bias[1] = (mag_max[1] + mag_min[1]) / 2;
+	mag_bias[2] = (mag_max[2] + mag_min[2]) / 2;
+	//✅ Step 5: Compute scale (soft iron)
+
+	mag_scale[0] = (mag_max[0] - mag_min[0]) / 2;
+	mag_scale[1] = (mag_max[1] - mag_min[1]) / 2;
+	mag_scale[2] = (mag_max[2] - mag_min[2]) / 2;
+	//Normalize scale
+	float avg = (mag_scale[0] + mag_scale[1] + mag_scale[2]) / 3;
+
+	mag_scale[0] = avg / mag_scale[0];
+	mag_scale[1] = avg / mag_scale[1];
+	mag_scale[2] = avg / mag_scale[2];
+}
+
+//@Read Mag sensor data
+void PayloadSensor::readMag(float &mx, float &my, float &mz)
+    {
+        uint8_t d[7];
+        readRegisters(MAG_ADDR, MAG_XOUT, d, 7);
+
+        int16_t x = (d[1]<<8) | d[0];
+        int16_t y = (d[3]<<8) | d[2];
+        int16_t z = (d[5]<<8) | d[4];
+
+        if (d[6] & 0x08) {
+            mx = my = mz = 0;
+            return;
+        }
+
+        mx_raw = x;
+        my_raw = y;
+        mz_raw = z;
+		
+		 // ASA correction (factory calibration)
+		mx = mx_raw * ((asa_x - 128.0f) / 256.0f + 1.0f);
+		my = my_raw * ((asa_y - 128.0f) / 256.0f + 1.0f);
+		mz = mz_raw * ((asa_z - 128.0f) / 256.0f + 1.0f);
+		
+		// Apply calibration
+	mx = (mx - mag_bias[0]) * mag_scale[0];
+	my = (my - mag_bias[1]) * mag_scale[1];
+	mz = (mz - mag_bias[2]) * mag_scale[2];
+    }
+ 
+ //@ Function for getting the raw data and do calculation on raw data   
+void PayloadSensor::calculateAngles() {
+    
+    float accel_x = ((float)ax_raw - accel_bias[0]) / accel_scale ;
+    float accel_y = ((float)ay_raw - accel_bias[1]) / accel_scale ;
+    float accel_z = ((float)az_raw - accel_bias[2]) / accel_scale ;
+    float gyro_x = ((float)gx_raw / gyro_scale - gyro_bias[0] ) * 0.017453f;
+    float gyro_y = ((float)gy_raw / gyro_scale - gyro_bias[1]) * 0.017453f;
+    float gyro_z = ((float)gz_raw / gyro_scale - gyro_bias[2]) * 0.017453f;
+     float mx, my, mz;
+    readMag(mx, my, mz);
+
+    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - previous_time).count();
+    float dt = std::chrono::duration<float> (now - previous_time).count();
+    previous_time = now;
+    ahrs.dt = dt;
+    float acc_norm = sqrt(accel_x * accel_x + accel_y * accel_y + accel_z * accel_z);
+
+    if (fabs(acc_norm - 1.0f) < 0.2f) {
+        ahrs.update(gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z, mx, my, mz);
+    }
+    else{
+        ahrs.update(gyro_x, gyro_y, gyro_z, 0, 0, 0,0,0,0);
+    }
+
+    float pitch,roll,yaw;
+    ahrs.getEuler(roll,pitch,yaw);
+    
+    static int counter=0;
+    if(++counter % 20 ==0){
+        //std::cout<<"\rPitch:" << pitch << "  Roll:"<< roll << "  Yaw:" << yaw << std::flush;
+        updateOrientation(roll,pitch,yaw);
+    }
+}
+
+//Update method every time we will get the angle data
+void PayloadSensor::MahonyAHRS::update(float gx, float gy, float gz,
+                        float ax, float ay, float az,
+                        float mx, float my, float mz){
+                             float norm;
+    float vx, vy, vz;
+    float ex, ey, ez;
+
+    // Normalize accelerometer
+    norm = sqrt(ax * ax + ay * ay + az * az);
+    if (norm == 0.0f) return;
+    ax /= norm;
+    ay /= norm;
+    az /= norm;
+
+    // Estimated gravity direction (from quaternion)
+    vx = 2.0f * (q1*q3 - q0*q2);
+    vy = 2.0f * (q0*q1 + q2*q3);
+    vz = q0*q0 - q1*q1 - q2*q2 + q3*q3;
+
+    // Error is cross product between measured & estimated gravity
+    ex = (ay * vz - az * vy);
+    ey = (az * vx - ax * vz);
+    ez = (ax * vy - ay * vx);
+
+    // ---- Magnetometer correction (optional but IMPORTANT for yaw) ----
+    if (!(mx == 0 && my == 0 && mz == 0)) {
+        float hx, hy, bx, bz;
+        float wx, wy, wz;
+
+        // Normalize magnetometer
+        norm = sqrt(mx * mx + my * my + mz * mz);
+        if (norm == 0.0f) return;
+        mx /= norm;
+        my /= norm;
+        mz /= norm;
+
+        // Reference direction of Earth's magnetic field
+        hx = 2.0f * mx * (0.5f - q2*q2 - q3*q3)
+           + 2.0f * my * (q1*q2 - q0*q3)
+           + 2.0f * mz * (q1*q3 + q0*q2);
+
+        hy = 2.0f * mx * (q1*q2 + q0*q3)
+           + 2.0f * my * (0.5f - q1*q1 - q3*q3)
+           + 2.0f * mz * (q2*q3 - q0*q1);
+
+        bx = sqrt(hx * hx + hy * hy);
+        bz = 2.0f * mx * (q1*q3 - q0*q2)
+           + 2.0f * my * (q2*q3 + q0*q1)
+           + 2.0f * mz * (0.5f - q1*q1 - q2*q2);
+
+        // Estimated magnetic direction
+        wx = 2.0f * bx * (0.5f - q2*q2 - q3*q3)
+           + 2.0f * bz * (q1*q3 - q0*q2);
+
+        wy = 2.0f * bx * (q1*q2 - q0*q3)
+           + 2.0f * bz * (q0*q1 + q2*q3);
+
+        wz = 2.0f * bx * (q0*q2 + q1*q3)
+           + 2.0f * bz * (0.5f - q1*q1 - q2*q2);
+
+        // Magnetic error
+        ex += (my * wz - mz * wy);
+        ey += (mz * wx - mx * wz);
+        ez += (mx * wy - my * wx);
+    }
+
+    // Integral feedback (gyro bias)
+    exInt += Ki * ex * dt;
+    eyInt += Ki * ey * dt;
+    ezInt += Ki * ez * dt;
+
+    // Apply corrections
+    gx += Kp * ex + exInt;
+    gy += Kp * ey + eyInt;
+    gz += Kp * ez + ezInt;
+
+    // Integrate quaternion
+    float qDot0 = -0.5f * (q1*gx + q2*gy + q3*gz);
+    float qDot1 =  0.5f * (q0*gx + q2*gz - q3*gy);
+    float qDot2 =  0.5f * (q0*gy - q1*gz + q3*gx);
+    float qDot3 =  0.5f * (q0*gz + q1*gy - q2*gx);
+
+    q0 += qDot0 * dt;
+    q1 += qDot1 * dt;
+    q2 += qDot2 * dt;
+    q3 += qDot3 * dt;
+
+    // Normalize quaternion
+    norm = sqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+    q0 /= norm;
+    q1 /= norm;
+    q2 /= norm;
+    q3 /= norm;
+}
+
+//@ Euler angle calculation
+void PayloadSensor::MahonyAHRS::getEuler(float &roll, float &pitch, float &yaw)
+{
+    roll  = atan2(2.0f*(q0*q1 + q2*q3),
+                  1.0f - 2.0f*(q1*q1 + q2*q2));
+
+    pitch = asin(2.0f*(q0*q2 - q3*q1));
+
+    yaw   = atan2(2.0f*(q0*q3 + q1*q2),
+                  1.0f - 2.0f*(q2*q2 + q3*q3));
+
+    // Convert to degrees if needed
+    roll  *= 57.29578f;
+    pitch *= 57.29578f;
+    yaw   *= 57.29578f;
+}
+
+void PayloadSensor::updateOrientation(float &roll, float &pitch, float &yaw)
+{
+	std::lock_guard<std::mutex> lock(payloadsensor_mutex);
+	payloadsensorpacket_.payloadsensor_Roll  = std::round(roll * 100.0f) / 100.0f;
+	payloadsensorpacket_.payloadsensor_Pitch = std::round(pitch * 100.0f) / 100.0f;
+	payloadsensorpacket_.payloadsensor_Yaw   = std::round(yaw * 100.0f) / 100.0f;
+}
+
+PayloadSensor::PayloadSensorPacket PayloadSensor::getOrientation()
+{
+	std::lock_guard<std::mutex> lock(payloadsensor_mutex);
+	return payloadsensorpacket_;
+}
+
+void PayloadSensor::start() {
+    if (!initialize()) {
+        std::cerr << "Failed to initialize MPU9250\n";
+        return;
+    }
+    if (!calibrate()) {
+        std::cerr << "Calibration failed\n";
+        return;
+    }
+	int i = 0;
+	/*float mx, my, mz;
+	while(i<=30){
+		std::cout << "Calibrating magnetometer for" << i << "sec\n" ;
+
+		readMag(mx, my, mz);
+		//readMag();
+		calibrateMagnetometer();
+		i++;
+		sleep(1);
+	}
+	computeMagnetometer();
+	std::cout << "Compass calibration finished\n";
+	std::cout << "mag_bias[0]: " << mag_bias[0] << " mag_bias[1]:" << mag_bias[1] << " mag_bias[2]:" << mag_bias[2]<< "\n";
+	std::cout << "mag_scale[0]:" << mag_scale[0] << " mag_scale[1]:" << mag_scale[1] << " mag_scale[2]:" << mag_scale[2] << "\n";
+
+    std::cout << "Reading sensor data, press Ctrl+C to stop\n";*/
+    std::cout << std::fixed << std::setprecision(2);
+    auto next_time = std::chrono::steady_clock::now();
+    while (_running.load()) {
+    next_time += std::chrono::milliseconds(1);
+    if (!readSensorData()) {
+            std::cerr << "Failed to read sensor data\n";
+            break;
+        }
+    calculateAngles();
+    
+    std::this_thread::sleep_until(next_time);
+    }
+
+    std::cout << "\nExiting sensor thread...\n";
+}
+
+void PayloadSensor::stop() {
+	if(!_running.load()){
+    close(i2c_fd);
+	}
+}
+
+

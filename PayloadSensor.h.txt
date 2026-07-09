@@ -1,0 +1,99 @@
+#ifndef PAYLOADSENSOR_H
+#define PAYLOADSENSOR_H
+
+#include <iostream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/i2c-dev.h>
+#include <cstring>
+#include <cstdint>
+#include <chrono>
+#include <thread>
+#include <math.h>
+#include <mutex>
+#include <atomic>
+
+
+class PayloadSensor
+{
+	public:
+		PayloadSensor(std::atomic<bool>& runFlag,const char* i2c_device = "/dev/i2c-1", uint8_t i2c_addr = 0x68);
+		~PayloadSensor();
+		
+		struct MahonyAHRS{
+			//Quaternion declare
+			float q0=1.0f,q1=0.0f, q2=0.0f, q3=0.0f;
+        
+			//Integral error
+			float exInt=0.0f, eyInt=0.0f, ezInt=0.0f;
+        
+			//Gains
+			float Kp=2.0f;
+			float Ki=0.005f;
+        
+			//Sample time
+			float dt=0.001f;
+        
+			void update(float gx, float gy, float gz,
+						float ax, float ay, float az,
+						float mx=0, float my=0, float mz=0);
+			void getEuler(float &roll, float &pitch, float &yaw);
+		};
+		
+		struct PayloadSensorPacket{
+			float payloadsensor_Roll=0.0f,payloadsensor_Pitch=0.0f,payloadsensor_Yaw=0.0f;
+		};
+		
+		std::mutex payloadsensor_mutex;
+		
+		
+		void updateOrientation(float &roll, float &pitch, float &yaw);
+		PayloadSensorPacket getOrientation();
+		PayloadSensorPacket payloadsensorpacket_{};
+		void start();
+		void stop();
+		
+	private:
+	    int i2c_fd;
+	    const char* i2c_device;
+	    uint8_t i2c_addr;
+	
+	    float accel_scale;
+	    float gyro_scale;
+	    float accel_bias[3];
+	    float gyro_bias[3];
+	    
+	    std::chrono::steady_clock::time_point previous_time;
+	    
+	    // Raw sensor data
+	    int16_t ax_raw, ay_raw, az_raw;
+	    int16_t gx_raw, gy_raw, gz_raw;
+		int16_t mx_raw, my_raw, mz_raw;
+		
+		float mag_min[3] = {+1e9, +1e9, +1e9};
+		float mag_max[3] = {-1e9, -1e9, -1e9};
+		float mag_bias[3];
+		float mag_scale[3];
+		
+		uint8_t asa_x;
+		uint8_t asa_y;
+		uint8_t asa_z;
+		
+		bool writeRegister(uint8_t reg, uint8_t data);
+	    bool readRegisters(uint8_t reg, uint8_t* buf, size_t len);
+	    bool writeRegister(uint8_t devAddr, uint8_t reg, uint8_t value);
+	    bool readRegisters(uint8_t devAddr, uint8_t reg, uint8_t* data, int len);
+		void computeMagnetometer();
+	    void readMag(float &mx, float &my, float &mz);
+	    bool setAddress(uint8_t addr);
+	    MahonyAHRS ahrs;
+	    
+	    bool initialize();
+	    bool calibrate(int samples = 1000);
+	    bool readSensorData();
+	    void calculateAngles();
+	    void calibrateMagnetometer();
+	    std::atomic<bool>& _running; 
+};
+#endif // PAYLOADSENSOR_H
